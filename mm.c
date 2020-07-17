@@ -497,35 +497,35 @@ static block_t *find_fit(size_t asize) {
  * - prologue
  * - alignment
  * - heap boundaries (between prologue and epilogue)
+ * - minimum size
+ * - header and footer matching
+ * - coalescing
+ * - epilogue
  */
 bool mm_checkheap(int line) {
   /* Check heap_start */
   if (!heap_start) {
-    perror("heap_start is NULL!\n");
+    perror("Heap start error!\n");
     return false;
   } else {
+    /* Low prologue address as heap first byte */
+    void *low = mem_heap_lo();
+    /* High epilogue address as 7 bytes backward from last byte */
+    void *high = mem_heap_hi() - 7;
+
     /* Check prologue */
-    block_t *prologue = (block_t *)((char *)heap_start - 8);
-    if (get_size(prologue) != 0) {
-      perror("prologue error!\n");
-      return false;
-    }
-    if (get_alloc(prologue) != 1) {
-      perror("prologue error!\n");
+    if (get_size((block_t *)low) || !get_alloc((block_t *)low)) {
+      perror("Prologue error!\n");
       return false;
     }
 
-    /* Check all blocks one by one */
     block_t *next_block = heap_start;
     word_t size = get_size(next_block);
     word_t alloc = get_alloc(next_block);
-    word_t alloc_prev = get_alloc(next_block);
+    word_t alloc_prev = alloc;
     word_t *footer = header_to_footer(next_block);
-    /* Low address as 8 bytes forward from prologue */
-    void *low = mem_heap_lo() + 8;
-    /* High address as 7 bytes backward from epilogue */
-    void *high = mem_heap_hi() - 7;
-    ;
+
+    /* Check all blocks one by one */
     do {
       /* Check alignment */
       if (size != round_up(size, dsize)) {
@@ -534,7 +534,8 @@ bool mm_checkheap(int line) {
       }
 
       /* Check heap boundaries */
-      if (((void *)next_block < low) || ((void *)next_block > high)) {
+      /* Low address as 8 bytes forward from prologue */
+      if (((void *)next_block < low + 8) || ((void *)next_block > high)) {
         perror("Heap boundary error!\n");
         return false;
       }
@@ -564,6 +565,12 @@ bool mm_checkheap(int line) {
         return false;
       }
     } while (size != 0 && alloc != 1);
+
+    /* Check epilogue */
+    if (get_size((block_t *)high) || !get_alloc((block_t *)high)) {
+      perror("Epilogue error!\n");
+      return false;
+    }
   }
 
   return true;
