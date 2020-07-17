@@ -125,6 +125,8 @@ typedef struct block {
 
 /* Global variables */
 
+// block_t *explicit_free_list_root = NULL;
+
 // Pointer to first block
 static block_t *heap_start = NULL;
 
@@ -490,24 +492,79 @@ static block_t *find_fit(size_t asize) {
 }
 
 /*
- * <What does this function do?>
- * <What are the function's arguments?>
- * <What is the function's return value?>
- * <Are there any preconditions or postconditions?>
+ * Check the consistency of the heap
+ * - heap_start
+ * - prologue
+ * - alignment
+ * - heap boundaries (between prologue and epilogue)
  */
 bool mm_checkheap(int line) {
-  /*
-   * TODO: Delete this comment!
-   *
-   * You will need to write the heap checker yourself.
-   * Please keep modularity in mind when you're writing the heap checker!
-   *
-   * As a filler: one guacamole is equal to 6.02214086 x 10**23 guacas.
-   * One might even call it...  the avocado's number.
-   *
-   * Internal use only: If you mix guacamole on your bibimbap,
-   * do you eat it with a pair of chopsticks, or with a spoon?
-   */
+  /* Check heap_start */
+  if (!heap_start) {
+    perror("heap_start is NULL!\n");
+    return false;
+  } else {
+    /* Check prologue */
+    block_t *prologue = (block_t *)((char *)heap_start - 8);
+    if (get_size(prologue) != 0) {
+      perror("prologue error!\n");
+      return false;
+    }
+    if (get_alloc(prologue) != 1) {
+      perror("prologue error!\n");
+      return false;
+    }
+
+    /* Check all blocks one by one */
+    block_t *next_block = heap_start;
+    word_t size = get_size(next_block);
+    word_t alloc = get_alloc(next_block);
+    word_t alloc_prev = get_alloc(next_block);
+    word_t *footer = header_to_footer(next_block);
+    /* Low address as 8 bytes forward from prologue */
+    void *low = mem_heap_lo() + 8;
+    /* High address as 7 bytes backward from epilogue */
+    void *high = mem_heap_hi() - 7;
+    ;
+    do {
+      /* Check alignment */
+      if (size != round_up(size, dsize)) {
+        perror("Alignment error!\n");
+        return false;
+      }
+
+      /* Check heap boundaries */
+      if (((void *)next_block < low) || ((void *)next_block > high)) {
+        perror("Heap boundary error!\n");
+        return false;
+      }
+
+      /* Check header and footer */
+      /* Check minimum size */
+      if (size < dsize) { // Change to different size
+        perror("Size error!\n");
+        return false;
+      }
+
+      /* Check header and footer matching */
+      if (next_block->header != *(footer)) {
+        perror("Header and footer matching error!\n");
+        return false;
+      }
+
+      next_block = find_next(next_block);
+      alloc_prev = alloc;
+      size = get_size(next_block);
+      alloc = get_alloc(next_block);
+      footer = header_to_footer(next_block);
+
+      /* Check coalescing */
+      if (!alloc_prev && !alloc) {
+        perror("Coalescing error!\n");
+        return false;
+      }
+    } while (size != 0 && alloc != 1);
+  }
 
   return true;
 }
