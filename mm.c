@@ -82,14 +82,15 @@ static const size_t dsize = 2 * wsize;
 // Minimum block size (bytes)
 static const size_t min_block_size = 2 * dsize;
 
-// TODO: explain what chunksize is
+// Expand heap by chunksize (4096)
+// each time no free space
 // (Must be divisible by dsize)
 static const size_t chunksize = (1 << 12);
 
-// TODO: explain what alloc_mask is
+// Mask to get the alloc bit
 static const word_t alloc_mask = 0x1;
 
-// TODO: explain what size_mask is
+// Mask to get the size
 static const word_t size_mask = ~(word_t)0xF;
 
 /* Represents the header and payload of one block in the heap */
@@ -97,14 +98,7 @@ typedef struct block {
   /* Header contains size + allocation flag */
   word_t header;
 
-  /*
-   * TODO: feel free to delete this comment once you've read it carefully.
-   * We don't know what the size of the payload will be, so we will declare
-   * it as a zero-length array, which is a GCC compiler extension. This will
-   * allow us to obtain a pointer to the start of the payload.
-   *
-   * WARNING: A zero-length array must be the last element in a struct, so
-   * there should not be any struct fields after it. For this lab, we will
+  /* For this lab, we will
    * allow you to include a zero-length array in a union, as long as the
    * union is the last field in its containing struct. However, this is
    * compiler-specific behavior and should be avoided in general.
@@ -115,17 +109,16 @@ typedef struct block {
    */
   char payload[0];
 
-  /*
-   * TODO: delete or replace this comment once you've thought about it.
-   * Why can't we declare the block footer here as part of the struct?
-   * Why do we even have footers -- will the code work fine without them?
-   * which functions actually use the data contained in footers?
-   */
 } block_t;
 
 /* Global variables */
 
-// block_t *explicit_free_list_root = NULL;
+/* Explicit free list root pointer, always points to the first inserted free
+ * block (LIFO) */
+block_t *explicit_list_root = NULL;
+/* Explicit free list tail pointer, always points to the last inserted free
+ * block (LIFO) */
+block_t *explicit_list_tail = NULL;
 
 // Pointer to first block
 static block_t *heap_start = NULL;
@@ -174,18 +167,16 @@ bool mm_init(void) {
   if (start == (void *)-1) {
     return false;
   }
-
-  /*
-   * TODO: delete or replace this comment once you've thought about it.
-   * Think about why we need a heap prologue and epilogue. Why do
-   * they correspond to a block footer and header respectively?
-   */
-
+  /* Heap prologue and epilogue preventing heap boundary coalescing */
   start[0] = pack(0, true); // Heap prologue (block footer)
   start[1] = pack(0, true); // Heap epilogue (block header)
 
   // Heap starts with first "block header", currently the epilogue
   heap_start = (block_t *)&(start[1]);
+  /* Free list root and tail pointer, initialize to heap start header, which
+   * will be the first free block by extend_heap */
+  explicit_list_root = heap_start;
+  explicit_list_tail = heap_start;
 
   // Extend the empty heap with a free block of chunksize bytes
   if (extend_heap(chunksize) == NULL) {
@@ -369,17 +360,26 @@ static block_t *extend_heap(size_t size) {
     return NULL;
   }
 
-  /*
-   * TODO: delete or replace this comment once you've thought about it.
-   * Think about what bp represents. Why do we write the new block
-   * starting one word BEFORE bp, but with the same size that we
-   * originally requested?
-   */
-
   // Initialize free block header/footer
+  /* The bp returned by mem_sbrk as the payload pointer. Payload to header will
+   * lead to the previous epilogue. Overwrite this epilogue as the new header.
+   */
   block_t *block = payload_to_header(bp);
   write_header(block, size, false);
   write_footer(block, size, false);
+  
+  /* Write next free list pointer as the previous root */
+  *(word_t *)(block + 1) = (word_t)explicit_list_root;
+  /* Update the current free list root pointer */
+  explicit_list_root = block;
+  /* Write prev free list pointer */
+  *(word_t *)(block + 2) = (word_t)explicit_list_tail;
+
+  /* Update the prev pointer of next free block to root */
+  *(word_t *)(*(word_t *)(block + 1) + 16) = (word_t)explicit_list_root;
+
+  /* Update the next pointer of prev free block to root */
+  *(word_t *)(*(word_t *)(block + 2) + 8) = (word_t)explicit_list_root;
 
   // Create new epilogue header
   block_t *block_next = find_next(block);
@@ -460,6 +460,7 @@ static void split_block(block_t *block, size_t asize) {
 
   size_t block_size = get_size(block);
 
+  /* Split if there is enough free space */
   if ((block_size - asize) >= min_block_size) {
     block_t *block_next;
     write_header(block, asize, true);
@@ -468,6 +469,9 @@ static void split_block(block_t *block, size_t asize) {
     block_next = find_next(block);
     write_header(block_next, block_size - asize, false);
     write_footer(block_next, block_size - asize, false);
+  }
+  /* Update the next and prev pointers */
+  else {
   }
 
   dbg_ensures(get_alloc(block));
@@ -542,7 +546,7 @@ bool mm_checkheap(int line) {
 
       /* Check header and footer */
       /* Check minimum size */
-      if (size < dsize) { // Change to different size
+      if (size < min_block_size) { // Change to different size
         perror("Size error!\n");
         return false;
       }
