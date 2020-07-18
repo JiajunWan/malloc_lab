@@ -85,7 +85,7 @@ static const size_t min_block_size = 2 * dsize;
 // Expand heap by chunksize (4096)
 // each time no free space
 // (Must be divisible by dsize)
-static const size_t chunksize = (1 << 12);
+static const size_t chunksize = (1L << 12);
 
 // Mask to get the alloc bit
 static const word_t alloc_mask = 0x1;
@@ -231,6 +231,8 @@ void *malloc(size_t size) {
   // The block should be marked as free
   dbg_assert(!get_alloc(block));
 
+
+
   // Mark block as allocated
   size_t block_size = get_size(block);
   write_header(block, block_size, true);
@@ -367,7 +369,7 @@ static block_t *extend_heap(size_t size) {
   block_t *block = payload_to_header(bp);
   write_header(block, size, false);
   write_footer(block, size, false);
-  
+
   /* Write next free list pointer as the previous root */
   *(word_t *)(block + 1) = (word_t)explicit_list_root;
   /* Update the current free list root pointer */
