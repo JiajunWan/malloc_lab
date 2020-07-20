@@ -120,10 +120,16 @@ block_t *explicit_list_root = NULL;
  * block (LIFO) */
 block_t *explicit_list_tail = NULL;
 
+// word_t malloc_count = 0;
+
 // Pointer to first block
 static block_t *heap_start = NULL;
 
 /* Function prototypes for internal helper routines */
+
+/* Own helpers */
+void remove_block(block_t *block);
+void insert_block(block_t *block, block_t *block_next);
 
 bool mm_checkheap(int lineno);
 
@@ -173,10 +179,10 @@ bool mm_init(void) {
 
   // Heap starts with first "block header", currently the epilogue
   heap_start = (block_t *)&(start[1]);
-  /* Free list root and tail pointer, initialize to heap start header, which
-   * will be the first free block by extend_heap */
-  explicit_list_root = heap_start;
-  explicit_list_tail = heap_start;
+  // /* Free list root and tail pointer, initialize to heap start header, which
+  //  * will be the first free block by extend_heap */
+  // explicit_list_root = heap_start;
+  // explicit_list_tail = heap_start;
 
   // Extend the empty heap with a free block of chunksize bytes
   if (extend_heap(chunksize) == NULL) {
@@ -194,6 +200,7 @@ bool mm_init(void) {
  */
 void *malloc(size_t size) {
   dbg_requires(mm_checkheap(__LINE__));
+  // malloc_count++;
 
   size_t asize;      // Adjusted block size
   size_t extendsize; // Amount to extend heap if no fit is found
@@ -230,8 +237,6 @@ void *malloc(size_t size) {
 
   // The block should be marked as free
   dbg_assert(!get_alloc(block));
-
-
 
   // Mark block as allocated
   size_t block_size = get_size(block);
@@ -370,25 +375,15 @@ static block_t *extend_heap(size_t size) {
   write_header(block, size, false);
   write_footer(block, size, false);
 
-  /* Write next free list pointer as the previous root */
-  *(word_t *)(block + 1) = (word_t)explicit_list_root;
-  /* Update the current free list root pointer */
-  explicit_list_root = block;
-  /* Write prev free list pointer */
-  *(word_t *)(block + 2) = (word_t)explicit_list_tail;
-
-  /* Update the prev pointer of next free block to root */
-  *(word_t *)(*(word_t *)(block + 1) + 16) = (word_t)explicit_list_root;
-
-  /* Update the next pointer of prev free block to root */
-  *(word_t *)(*(word_t *)(block + 2) + 8) = (word_t)explicit_list_root;
-
   // Create new epilogue header
-  block_t *block_next = find_next(block);
-  write_header(block_next, 0, true);
+  block_t *block_epilogue = find_next(block);
+  write_header(block_epilogue, 0, true);
 
   // Coalesce in case the previous block was free
   block = coalesce_block(block);
+
+  // /* Insert new block at root */
+  // insert_block(block, explicit_list_root);
 
   return block;
 }
@@ -404,37 +399,44 @@ static block_t *coalesce_block(block_t *block) {
 
   size_t size = get_size(block);
 
-  /*
-   * TODO: delete or replace this comment once you've thought about it.
-   * Think about how we find the prev and next blocks. What information
-   * do we need to have about the heap in order to do this? Why doesn't
-   * "bool prev_alloc = get_alloc(block_prev)" work properly?
-   */
-
+  /* Consecutive next and prev blocks, not free list next or prev block */
   block_t *block_next = find_next(block);
   block_t *block_prev = find_prev(block);
 
+  /* Extract footer alloc bit */
   bool prev_alloc = extract_alloc(*find_prev_footer(block));
+  /* Get header alloc bit */
   bool next_alloc = get_alloc(block_next);
 
   if (prev_alloc && next_alloc) // Case 1
   {
-    // Nothing to do
+    /* Insert at root */
+    insert_block(block, explicit_list_root);
   }
 
   else if (prev_alloc && !next_alloc) // Case 2
   {
+    /* Update the size of new free block */
     size += get_size(block_next);
     write_header(block, size, false);
     write_footer(block, size, false);
+
+    /* Remove next block from list and insert at root */
+    remove_block(block_next);
+    insert_block(block, explicit_list_root);
   }
 
   else if (!prev_alloc && next_alloc) // Case 3
   {
+    remove_block(block_prev);
+
     size += get_size(block_prev);
     write_header(block_prev, size, false);
     write_footer(block_prev, size, false);
     block = block_prev;
+
+    /* Remove block from list and insert at root */
+    insert_block(block, explicit_list_root);
   }
 
   else // Case 4
@@ -443,6 +445,11 @@ static block_t *coalesce_block(block_t *block) {
     write_header(block_prev, size, false);
     write_footer(block_prev, size, false);
     block = block_prev;
+
+    /* Remove next block and block from list and insert at root */
+    remove_block(block_next);
+    remove_block(block);
+    insert_block(block, explicit_list_root);
   }
 
   dbg_ensures(!get_alloc(block));
@@ -462,18 +469,35 @@ static void split_block(block_t *block, size_t asize) {
 
   size_t block_size = get_size(block);
 
+  /* Get next block */
+  block_t *block_next = (block_t *)*(word_t *)(block->payload);
+  // block_t *block_prev = (block_t *)*(word_t *)(block->payload + wsize);
+
   /* Split if there is enough free space */
   if ((block_size - asize) >= min_block_size) {
-    block_t *block_next;
     write_header(block, asize, true);
     write_footer(block, asize, true);
 
-    block_next = find_next(block);
-    write_header(block_next, block_size - asize, false);
-    write_footer(block_next, block_size - asize, false);
+    /* Splited new block */
+    block_t *block_new = find_next(block);
+    write_header(block_new, block_size - asize, false);
+    write_footer(block_new, block_size - asize, false);
+
+    /* Check if there is only one free block in the list */
+    if (explicit_list_root == explicit_list_tail) {
+      remove_block(block);
+      insert_block(block_new, explicit_list_root);
+    }
+    /* More than one free block in the list */
+    else {
+      /* Remove old block and insert new block before next block */
+      remove_block(block);
+      insert_block(block_new, block_next);
+    }
   }
-  /* Update the next and prev pointers */
+  /* No split, update the next and prev pointers */
   else {
+    remove_block(block);
   }
 
   dbg_ensures(get_alloc(block));
@@ -486,15 +510,31 @@ static void split_block(block_t *block, size_t asize) {
  * <Are there any preconditions or postconditions?>
  */
 static block_t *find_fit(size_t asize) {
-  block_t *block;
-
-  for (block = heap_start; get_size(block) > 0; block = find_next(block)) {
-
-    if (!(get_alloc(block)) && (asize <= get_size(block))) {
-      return block;
-    }
+  if (explicit_list_root == NULL) {
+    return NULL;
   }
-  return NULL; // no fit found
+  block_t *block = explicit_list_root;
+  block_t *block_best = NULL;
+  word_t size = get_size(block);
+  word_t size_best = size;
+  word_t timeout = 5;
+  word_t i = 0;
+
+  /* Traverse the free list */
+  do {
+    size = get_size(block);
+    /* Find best fit */
+    if (asize <= size) {
+      if (size <= size_best) {
+        block_best = block;
+        size_best = size;
+      }
+      i++;
+    }
+    block = (block_t *)*(word_t *)(block->payload);
+  } while (i < timeout && block != explicit_list_root);
+
+  return block_best;
 }
 
 /*
@@ -509,6 +549,9 @@ static block_t *find_fit(size_t asize) {
  * - epilogue
  */
 bool mm_checkheap(int line) {
+  word_t num_free_block = 0;
+  word_t num_free_list_root_tail = 0;
+  word_t num_free_list_tail_root = 0;
   /* Check heap_start */
   if (!heap_start) {
     perror("Heap start error!\n");
@@ -525,14 +568,19 @@ bool mm_checkheap(int line) {
       return false;
     }
 
-    block_t *next_block = heap_start;
-    word_t size = get_size(next_block);
-    word_t alloc = get_alloc(next_block);
-    word_t alloc_prev = alloc;
-    word_t *footer = header_to_footer(next_block);
+    block_t *block = heap_start;
+    word_t size;
+    word_t alloc;
+    word_t alloc_next;
+    word_t *footer = NULL;
 
     /* Check all blocks one by one */
     do {
+      size = get_size(block);
+      alloc = get_alloc(block);
+      alloc_next = get_alloc(find_next(block));
+      footer = header_to_footer(block);
+
       /* Check alignment */
       if (size != round_up(size, dsize)) {
         perror("Alignment error!\n");
@@ -541,36 +589,114 @@ bool mm_checkheap(int line) {
 
       /* Check heap boundaries */
       /* Low address as 8 bytes forward from prologue */
-      if (((void *)next_block < low + 8) || ((void *)next_block > high)) {
+      if (((void *)block < low + 8) || ((void *)block > high)) {
         perror("Heap boundary error!\n");
         return false;
       }
 
       /* Check header and footer */
       /* Check minimum size */
-      if (size < min_block_size) { // Change to different size
+      if (size < min_block_size) {
         perror("Size error!\n");
         return false;
       }
 
       /* Check header and footer matching */
-      if (next_block->header != *(footer)) {
+      if (block->header != *(footer)) {
         perror("Header and footer matching error!\n");
         return false;
       }
 
-      next_block = find_next(next_block);
-      alloc_prev = alloc;
-      size = get_size(next_block);
-      alloc = get_alloc(next_block);
-      footer = header_to_footer(next_block);
+      /* Count free blocks */
+      if (!alloc) {
+        num_free_block++;
+        /* Check heap boundaries */
+        /* Low address as 8 bytes forward from prologue */
+        if (((void *)*(word_t *)(block->payload) < low + 8) ||
+            ((void *)*(word_t *)(block->payload) > high) ||
+            ((void *)*(word_t *)(block->payload + wsize) < low + 8) ||
+            ((void *)*(word_t *)(block->payload + wsize) > high)) {
+          perror("Next/prev pointers heap boundary error!\n");
+          return false;
+        }
+      }
 
       /* Check coalescing */
-      if (!alloc_prev && !alloc) {
+      if (!alloc && !alloc_next) {
         perror("Coalescing error!\n");
         return false;
       }
-    } while (size != 0 && alloc != 1);
+
+      block = find_next(block);
+    } while (block != (block_t *)high);
+
+    /* Check free list */
+    block_t *block_curr;
+    block_t *block_next;
+    block_t *block_prev;
+
+    block_curr = explicit_list_root;
+    if (explicit_list_root != NULL & explicit_list_tail != NULL) {
+      /* Check from root to tail */
+      do {
+        block_next = (block_t *)*(word_t *)(block_curr->payload);
+        /* Check next/prev pointers consistency */
+        if (block_curr != (block_t *)*(word_t *)(block_next->payload + wsize)) {
+          perror("next/prev pointers inconsistent error!\n");
+          return false;
+        }
+
+        /* Check heap boundaries */
+        /* Low address as 8 bytes forward from prologue */
+        if (((void *)*(word_t *)(block_curr->payload) < low + 8) ||
+            ((void *)*(word_t *)(block_curr->payload) > high) ||
+            ((void *)*(word_t *)(block_curr->payload + wsize) < low + 8) ||
+            ((void *)*(word_t *)(block_curr->payload + wsize) > high)) {
+          perror("Next/prev pointers heap boundary error!\n");
+          return false;
+        }
+        /* Count free list */
+        num_free_list_root_tail++;
+
+        block_curr = (block_t *)*(word_t *)(block_curr->payload);
+      } while (block_curr != explicit_list_root);
+
+      block_curr = explicit_list_tail;
+      /* Check from tail to root */
+      do {
+        block_prev = (block_t *)*(word_t *)(block_curr->payload + wsize);
+        /* Check next/prev pointers consistency */
+        if (block_curr != (block_t *)*(word_t *)(block_prev->payload)) {
+          perror("next/prev pointers inconsistent error!\n");
+          return false;
+        }
+
+        /* Check heap boundaries */
+        /* Low address as 8 bytes forward from prologue */
+        if (((void *)*(word_t *)(block_curr->payload) < low + 8) ||
+            ((void *)*(word_t *)(block_curr->payload) > high) ||
+            ((void *)*(word_t *)(block_curr->payload + wsize) < low + 8) ||
+            ((void *)*(word_t *)(block_curr->payload + wsize) > high)) {
+          perror("Next/prev pointers heap boundary error!\n");
+          return false;
+        }
+        /* Count free list */
+        num_free_list_tail_root++;
+
+        block_curr = (block_t *)*(word_t *)(block_curr->payload + wsize);
+      } while (block_curr != explicit_list_tail);
+    }
+
+    /* Check free block/free list numbers consistency */
+    if (num_free_block != num_free_list_root_tail ||
+        num_free_block != num_free_list_tail_root ||
+        num_free_list_root_tail != num_free_list_tail_root) {
+      perror("Free block numbers inconsistent error!");
+      printf("num_free_block: %lu\n", num_free_block);
+      printf("num_free_list_root_tail: %lu\n", num_free_list_root_tail);
+      printf("num_free_list_tail_root: %lu\n", num_free_list_tail_root);
+      return false;
+    }
 
     /* Check epilogue */
     if (get_size((block_t *)high) || !get_alloc((block_t *)high)) {
@@ -580,6 +706,86 @@ bool mm_checkheap(int line) {
   }
 
   return true;
+}
+
+void remove_block(block_t *block) {
+  /* Case 1: Only one block */
+  if (block == explicit_list_root && block == explicit_list_tail) {
+    explicit_list_root = explicit_list_tail = NULL;
+  }
+
+  /* Case 2: Block is root */
+  else if (block == explicit_list_root) {
+    /* Root is next block */
+    explicit_list_root = (block_t *)*(word_t *)(block->payload);
+    *(word_t *)(explicit_list_root->payload + wsize) =
+        (word_t) & (explicit_list_tail->header);
+    *(word_t *)(explicit_list_tail->payload) =
+        (word_t) & (explicit_list_root->header);
+  }
+
+  /* Case 3: Block is tail */
+  else if (block == explicit_list_tail) {
+    /* Tail is prev block */
+    explicit_list_tail = (block_t *)*(word_t *)(block->payload + wsize);
+    *(word_t *)(explicit_list_root->payload + wsize) =
+        (word_t) & (explicit_list_tail->header);
+    *(word_t *)(explicit_list_tail->payload) =
+        (word_t) & (explicit_list_root->header);
+  }
+
+  /* Case 4: Block is in the middle */
+  else {
+    block_t *block_next = (block_t *)*(word_t *)(block->payload);
+    block_t *block_prev = (block_t *)*(word_t *)(block->payload + wsize);
+    *(word_t *)(block_prev->payload) = (word_t) & (block_next->header);
+    *(word_t *)(block_next->payload + wsize) = (word_t) & (block_prev->header);
+  }
+}
+
+void insert_block(block_t *block, block_t *block_next) {
+  /* Case 1: No next block, empty list */
+  if (block_next == NULL) {
+    explicit_list_root = explicit_list_tail = block;
+    *(word_t *)(explicit_list_root->payload) =
+        (word_t) & (explicit_list_tail->header);
+    *(word_t *)(explicit_list_root->payload + wsize) =
+        (word_t) & (explicit_list_tail->header);
+  }
+
+  /* Case 2: Only one block */
+  else if (block_next == explicit_list_root &&
+           block_next == explicit_list_tail) {
+    explicit_list_root = block;
+    *(word_t *)(explicit_list_root->payload) =
+        (word_t) & (explicit_list_tail->header);
+    *(word_t *)(explicit_list_root->payload + wsize) =
+        (word_t) & (explicit_list_tail->header);
+    *(word_t *)(explicit_list_tail->payload) =
+        (word_t) & (explicit_list_root->header);
+    *(word_t *)(explicit_list_tail->payload + wsize) =
+        (word_t) & (explicit_list_root->header);
+  }
+
+  /* Case 2: Block_next is root */
+  else if (block_next == explicit_list_root) {
+    *(word_t *)(block->payload) = (word_t) & (explicit_list_root->header);
+    *(word_t *)(explicit_list_root->payload + wsize) =
+        (word_t) & (block->header);
+    *(word_t *)(block->payload + wsize) =
+        (word_t) & (explicit_list_tail->header);
+    *(word_t *)(explicit_list_tail->payload) = (word_t) & (block->header);
+    explicit_list_root = block;
+  }
+
+  /* Case 3: Insert in the middle */
+  else {
+    block_t *block_prev = (block_t *)*(word_t *)(block_next->payload + wsize);
+    *(word_t *)(block->payload) = (word_t) & (block_next->header);
+    *(word_t *)(block->payload + wsize) = (word_t) & (block_prev->header);
+    *(word_t *)(block_prev->payload) = (word_t) & (block->header);
+    *(word_t *)(block_next->payload + wsize) = (word_t) & (block->header);
+  }
 }
 
 /*
