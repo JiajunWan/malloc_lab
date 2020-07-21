@@ -97,31 +97,15 @@ static const word_t size_mask = ~(word_t)0xF;
 typedef struct block {
   /* Header contains size + allocation flag */
   word_t header;
-
-  /* For this lab, we will
-   * allow you to include a zero-length array in a union, as long as the
-   * union is the last field in its containing struct. However, this is
-   * compiler-specific behavior and should be avoided in general.
-   *
-   * WARNING: DO NOT cast this pointer to/from other types! Instead, you
-   * should use a union to alias this zero-length array with another struct,
-   * in order to store additional types of data in the payload memory.
-   */
   char payload[0];
-
 } block_t;
 
 /* Global variables */
 
-/* Explicit free list root pointer, always points to the first inserted free
- * block (LIFO) */
+/* Explicit free list root pointer, lowest address, insert starting point */
 block_t *explicit_list_root = NULL;
-/* Explicit free list tail pointer, always points to the last inserted free
- * block (LIFO) */
-block_t *explicit_list_tail = NULL;
 
-size_t malloc_count = 0;
-size_t free_no_coal_count = 0;
+// word_t malloc_count = 0;
 
 // Pointer to first block
 static block_t *heap_start = NULL;
@@ -129,8 +113,10 @@ static block_t *heap_start = NULL;
 /* Function prototypes for internal helper routines */
 
 /* Own helpers */
+/* Remove free list block */
 void remove_block(block_t *block);
-void insert_block(block_t *block, block_t *block_next);
+/* Address order insertion */
+void insert_block(block_t *block);
 void print_heap();
 
 bool mm_checkheap(int lineno);
@@ -181,6 +167,7 @@ bool mm_init(void) {
 
   // Heap starts with first "block header", currently the epilogue
   heap_start = (block_t *)&(start[1]);
+  explicit_list_root = NULL;
 
   // Extend the empty heap with a free block of chunksize bytes
   if (extend_heap(chunksize) == NULL) {
@@ -198,21 +185,18 @@ bool mm_init(void) {
  */
 void *malloc(size_t size) {
   dbg_requires(mm_checkheap(__LINE__));
-  malloc_count++;
-  // printf("1 ");
+  // malloc_count++;
 
   size_t asize;      // Adjusted block size
   size_t extendsize; // Amount to extend heap if no fit is found
   block_t *block;
   void *bp = NULL;
 
-  if (heap_start == NULL) // Initialize heap if it isn't initialized
-  {
+  if (heap_start == NULL) { // Initialize heap if it isn't initialized
     mm_init();
   }
 
-  if (size == 0) // Ignore spurious request
-  {
+  if (size == 0) { // Ignore spurious request
     dbg_ensures(mm_checkheap(__LINE__));
     return bp;
   }
@@ -225,28 +209,11 @@ void *malloc(size_t size) {
 
   // If no fit is found, request more memory, and then and place the block
   if (block == NULL) {
-    /* Deferred coalescing */
-    block = heap_start;
-    do {
-      if (!get_alloc(block)) {
-        block = coalesce_block(block);
-        if (asize <= get_size(block)) {
-          break;
-        }
-      }
-      block = find_next(block);
-    } while (block != (block_t *)(mem_heap_hi() - 7));
-
-    // block = find_fit(asize);
-
-    if (block == (block_t *)(mem_heap_hi() - 7)) {
-      // Always request at least chunksize
-      extendsize = max(asize, chunksize);
-      block = extend_heap(extendsize);
-      if (block == NULL) // extend_heap returns an error
-      {
-        return bp;
-      }
+    // Always request at least chunksize
+    extendsize = max(asize, chunksize);
+    block = extend_heap(extendsize);
+    if (block == NULL) { // extend_heap returns an error
+      return bp;
     }
   }
 
@@ -275,8 +242,6 @@ void *malloc(size_t size) {
  */
 void free(void *bp) {
   dbg_requires(mm_checkheap(__LINE__));
-  malloc_count--;
-  // printf("2 ");
 
   if (bp == NULL) {
     return;
@@ -293,28 +258,7 @@ void free(void *bp) {
   write_footer(block, size, false);
 
   // Try to coalesce the block with its neighbors
-  // block = coalesce_block(block);
-
-  /* Deferred coalescing, just insert */
-  insert_block(block, explicit_list_root);
-  free_no_coal_count++;
-
-  if (malloc_count == 0 || free_no_coal_count > 3) {
-    /* Deferred coalescing */
-    block = explicit_list_root;
-    block_t *block_next = (block_t *)*(word_t *)(block->payload);
-    do {
-      if (!get_alloc(block)) {
-        block_next = (block_t *)*(word_t *)(block->payload);
-        block = coalesce_block(block);
-        /* Check if next is coalesced */
-        if (block_next != (block_t *)*(word_t *)(block->payload)) {
-          block_next = (block_t *)*(word_t *)(block_next->payload);
-        }
-      }
-      block = block_next;
-    } while (block != explicit_list_root);
-  }
+  block = coalesce_block(block);
 
   dbg_ensures(mm_checkheap(__LINE__));
 }
@@ -325,6 +269,7 @@ void free(void *bp) {
  * <What is the function's return value?>
  * <Are there any preconditions or postconditions?>
  */
+/* Can optimize realloc */
 void *realloc(void *ptr, size_t size) {
   block_t *block = payload_to_header(ptr);
   size_t copysize;
@@ -418,10 +363,10 @@ static block_t *extend_heap(size_t size) {
   write_header(block_epilogue, 0, true);
 
   // Coalesce in case the previous block was free
-  // block = coalesce_block(block);
+  block = coalesce_block(block);
 
-  insert_block(block, explicit_list_root);
-  free_no_coal_count++;
+  // /* Insert new block at root */
+  // insert_block(block);
 
   return block;
 }
@@ -443,21 +388,15 @@ static block_t *coalesce_block(block_t *block) {
 
   /* Extract footer alloc bit */
   bool prev_alloc = extract_alloc(*find_prev_footer(block));
-  // if (block_prev == block) {
-  //   prev_alloc = true;
-  // }
   /* Get header alloc bit */
   bool next_alloc = get_alloc(block_next);
 
-  if (prev_alloc && next_alloc) // Case 1
-  {
+  if (prev_alloc && next_alloc) { // Case 1
     /* Insert at root */
-    /* Deferred coelascing comment out */
-    // insert_block(block, explicit_list_root);
+    insert_block(block);
   }
 
-  else if (prev_alloc && !next_alloc) // Case 2
-  {
+  else if (prev_alloc && !next_alloc) { // Case 2
     /* Update the size of new free block */
     size += get_size(block_next);
     write_header(block, size, false);
@@ -465,21 +404,11 @@ static block_t *coalesce_block(block_t *block) {
 
     /* Remove next block from list and insert at root */
     remove_block(block_next);
-
-    /* Deferred coalescing */
-    remove_block(block);
-    free_no_coal_count--;
-
-    insert_block(block, explicit_list_root);
+    insert_block(block);
   }
 
-  else if (!prev_alloc && next_alloc) // Case 3
-  {
+  else if (!prev_alloc && next_alloc) { // Case 3
     remove_block(block_prev);
-
-    /* Deferred coalescing */
-    remove_block(block);
-    free_no_coal_count--;
 
     size += get_size(block_prev);
     write_header(block_prev, size, false);
@@ -487,15 +416,10 @@ static block_t *coalesce_block(block_t *block) {
     block = block_prev;
 
     /* Remove block from list and insert at root */
-    insert_block(block, explicit_list_root);
+    insert_block(block);
   }
 
-  else // Case 4
-  {
-    /* Deferred coalescing */
-    remove_block(block);
-    free_no_coal_count--;
-
+  else { // Case 4
     size += get_size(block_next) + get_size(block_prev);
     write_header(block_prev, size, false);
     write_footer(block_prev, size, false);
@@ -504,7 +428,7 @@ static block_t *coalesce_block(block_t *block) {
     /* Remove next block and block from list and insert at root */
     remove_block(block_next);
     remove_block(block);
-    insert_block(block, explicit_list_root);
+    insert_block(block);
   }
 
   dbg_ensures(!get_alloc(block));
@@ -521,12 +445,9 @@ static block_t *coalesce_block(block_t *block) {
 static void split_block(block_t *block, size_t asize) {
   dbg_requires(get_alloc(block));
   /* TODO: Can you write a precondition about the value of asize? */
+  remove_block(block);
 
   size_t block_size = get_size(block);
-
-  /* Get next block */
-  block_t *block_next = (block_t *)*(word_t *)(block->payload);
-  // block_t *block_prev = (block_t *)*(word_t *)(block->payload + wsize);
 
   /* Split if there is enough free space */
   if ((block_size - asize) >= min_block_size) {
@@ -538,21 +459,7 @@ static void split_block(block_t *block, size_t asize) {
     write_header(block_new, block_size - asize, false);
     write_footer(block_new, block_size - asize, false);
 
-    /* Check if there is only one free block in the list */
-    if (explicit_list_root == explicit_list_tail) {
-      remove_block(block);
-      insert_block(block_new, explicit_list_root);
-    }
-    /* More than one free block in the list */
-    else {
-      /* Remove old block and insert new block before next block */
-      remove_block(block);
-      insert_block(block_new, block_next);
-    }
-  }
-  /* No split, update the next and prev pointers */
-  else {
-    remove_block(block);
+    insert_block(block_new);
   }
 
   dbg_ensures(get_alloc(block));
@@ -572,13 +479,12 @@ static block_t *find_fit(size_t asize) {
   block_t *block_best = NULL;
   size_t size = 0;
   size_t size_best = 0;
-  int timeout = 4;
+  int timeout = 2;
   int i = 0;
   bool found_fit = false;
 
   /* Traverse the free list */
   do {
-    // block = coalesce_block(block);
     size = get_size(block);
     /* Find best fit */
     if (asize <= size) {
@@ -588,7 +494,6 @@ static block_t *find_fit(size_t asize) {
         found_fit = true;
       }
       if (size <= size_best) {
-        // block = coalesce_block(block);
         block_best = block;
         size_best = size;
       }
@@ -598,42 +503,6 @@ static block_t *find_fit(size_t asize) {
   } while (i < timeout && block != explicit_list_root);
 
   return block_best;
-}
-
-void print_heap() {
-  block_t *block = heap_start;
-  word_t size;
-  word_t alloc;
-  word_t alloc_next;
-  word_t num_free_block = 0;
-
-  /* High epilogue address as 7 bytes backward from last byte */
-  void *high = mem_heap_hi() - 7;
-
-  /* Check all blocks one by one */
-  do {
-    size = get_size(block);
-    alloc = get_alloc(block);
-    alloc_next = get_alloc(find_next(block));
-    if (alloc) {
-      printf("alloc: %#011lx: %lu\n", (word_t) & (block->header), size);
-    }
-    if (!alloc) {
-      num_free_block++;
-      printf("free : %#011lx: %lu next: %#011lx, prev: %#011lx\n",
-             (word_t) & (block->header), size, *(word_t *)(block->payload),
-             *(word_t *)(block->payload + wsize));
-    }
-
-    /* Check coalescing */
-    // if (!alloc && !alloc_next) {
-    //   printf("Deferred coalescing at: %#011lx\n", (word_t) &
-    //   (block->header));
-    // }
-
-    block = find_next(block);
-  } while (block != (block_t *)high);
-  printf("Free blocks: %lu\n", num_free_block);
 }
 
 /*
@@ -652,8 +521,7 @@ void print_heap() {
  */
 bool mm_checkheap(int line) {
   word_t num_free_block = 0;
-  word_t num_free_list_root_tail = 0;
-  word_t num_free_list_tail_root = 0;
+  word_t num_free_list = 0;
   /* Check heap_start */
   if (!heap_start) {
     perror("Heap start error!\n");
@@ -724,10 +592,10 @@ bool mm_checkheap(int line) {
       }
 
       /* Check coalescing */
-      // if (!alloc && !alloc_next) {
-      //   perror("Coalescing error!\n");
-      //   return false;
-      // }
+      if (!alloc && !alloc_next) {
+        perror("Coalescing error!\n");
+        return false;
+      }
 
       block = find_next(block);
     } while (block != (block_t *)high);
@@ -735,11 +603,10 @@ bool mm_checkheap(int line) {
     /* Check free list */
     block_t *block_curr;
     block_t *block_next;
-    block_t *block_prev;
 
     block_curr = explicit_list_root;
-    if (explicit_list_root != NULL & explicit_list_tail != NULL) {
-      /* Check from root to tail */
+    if (explicit_list_root != NULL) {
+      /* Check from root */
       do {
         block_next = (block_t *)*(word_t *)(block_curr->payload);
         /* Check next/prev pointers consistency */
@@ -758,41 +625,14 @@ bool mm_checkheap(int line) {
           return false;
         }
         /* Count free list */
-        num_free_list_root_tail++;
+        num_free_list++;
 
         block_curr = (block_t *)*(word_t *)(block_curr->payload);
       } while (block_curr != explicit_list_root);
-
-      block_curr = explicit_list_tail;
-      /* Check from tail to root */
-      do {
-        block_prev = (block_t *)*(word_t *)(block_curr->payload + wsize);
-        /* Check next/prev pointers consistency */
-        if (block_curr != (block_t *)*(word_t *)(block_prev->payload)) {
-          perror("Next/prev pointers inconsistent error!\n");
-          return false;
-        }
-
-        /* Check heap boundaries */
-        /* Low address as 8 bytes forward from prologue */
-        if (((void *)*(word_t *)(block_curr->payload) < low + 8) ||
-            ((void *)*(word_t *)(block_curr->payload) > high) ||
-            ((void *)*(word_t *)(block_curr->payload + wsize) < low + 8) ||
-            ((void *)*(word_t *)(block_curr->payload + wsize) > high)) {
-          perror("Next/prev pointers heap boundary error!\n");
-          return false;
-        }
-        /* Count free list */
-        num_free_list_tail_root++;
-
-        block_curr = (block_t *)*(word_t *)(block_curr->payload + wsize);
-      } while (block_curr != explicit_list_tail);
     }
 
     /* Check free block/free list numbers consistency */
-    if (num_free_block != num_free_list_root_tail ||
-        num_free_block != num_free_list_tail_root ||
-        num_free_list_root_tail != num_free_list_tail_root) {
+    if (num_free_block != num_free_list) {
       perror("Free block numbers inconsistent error!");
       return false;
     }
@@ -803,37 +643,26 @@ bool mm_checkheap(int line) {
       return false;
     }
   }
-
   return true;
 }
 
 void remove_block(block_t *block) {
   /* Case 1: Only one block */
-  if (block == explicit_list_root && block == explicit_list_tail) {
-    explicit_list_root = explicit_list_tail = NULL;
+  if (explicit_list_root ==
+      (block_t *)*(word_t *)(explicit_list_root->payload)) {
+    explicit_list_root = NULL;
   }
 
   /* Case 2: Block is root */
   else if (block == explicit_list_root) {
-    /* Root is next block */
+    block_t *tail = (block_t *)*(word_t *)(explicit_list_root->payload + wsize);
     explicit_list_root = (block_t *)*(word_t *)(block->payload);
     *(word_t *)(explicit_list_root->payload + wsize) =
-        (word_t) & (explicit_list_tail->header);
-    *(word_t *)(explicit_list_tail->payload) =
-        (word_t) & (explicit_list_root->header);
+        (word_t) & (tail->header);
+    *(word_t *)(tail->payload) = (word_t) & (explicit_list_root->header);
   }
 
-  /* Case 3: Block is tail */
-  else if (block == explicit_list_tail) {
-    /* Tail is prev block */
-    explicit_list_tail = (block_t *)*(word_t *)(block->payload + wsize);
-    *(word_t *)(explicit_list_root->payload + wsize) =
-        (word_t) & (explicit_list_tail->header);
-    *(word_t *)(explicit_list_tail->payload) =
-        (word_t) & (explicit_list_root->header);
-  }
-
-  /* Case 4: Block is in the middle */
+  /* Case 3: Block is else where */
   else {
     block_t *block_next = (block_t *)*(word_t *)(block->payload);
     block_t *block_prev = (block_t *)*(word_t *)(block->payload + wsize);
@@ -842,49 +671,79 @@ void remove_block(block_t *block) {
   }
 }
 
-void insert_block(block_t *block, block_t *block_next) {
+void insert_block(block_t *block) {
   /* Case 1: No next block, empty list */
-  if (block_next == NULL) {
-    explicit_list_root = explicit_list_tail = block;
-    *(word_t *)(explicit_list_root->payload) =
-        (word_t) & (explicit_list_tail->header);
-    *(word_t *)(explicit_list_root->payload + wsize) =
-        (word_t) & (explicit_list_tail->header);
-  }
-
-  /* Case 2: Only one block */
-  else if (block_next == explicit_list_root &&
-           block_next == explicit_list_tail) {
+  if (explicit_list_root == NULL) {
     explicit_list_root = block;
     *(word_t *)(explicit_list_root->payload) =
-        (word_t) & (explicit_list_tail->header);
-    *(word_t *)(explicit_list_root->payload + wsize) =
-        (word_t) & (explicit_list_tail->header);
-    *(word_t *)(explicit_list_tail->payload) =
         (word_t) & (explicit_list_root->header);
-    *(word_t *)(explicit_list_tail->payload + wsize) =
+    *(word_t *)(explicit_list_root->payload + wsize) =
         (word_t) & (explicit_list_root->header);
   }
 
-  /* Case 3: Block_next is root */
-  else if (block_next == explicit_list_root) {
+  /* Case 2: Address before root */
+  else if ((word_t) & (block->header) < (word_t) &
+           (explicit_list_root->header)) {
+    block_t *tail = (block_t *)*(word_t *)(explicit_list_root->payload + wsize);
+    *(word_t *)(tail->payload) = (word_t) & (block->header);
     *(word_t *)(block->payload) = (word_t) & (explicit_list_root->header);
     *(word_t *)(explicit_list_root->payload + wsize) =
         (word_t) & (block->header);
-    *(word_t *)(block->payload + wsize) =
-        (word_t) & (explicit_list_tail->header);
-    *(word_t *)(explicit_list_tail->payload) = (word_t) & (block->header);
+    *(word_t *)(block->payload + wsize) = (word_t) & (tail->header);
     explicit_list_root = block;
   }
 
-  /* Case 4: Insert in the middle */
+  /* Case 3: Address after root */
   else {
-    block_t *block_prev = (block_t *)*(word_t *)(block_next->payload + wsize);
-    *(word_t *)(block->payload) = (word_t) & (block_next->header);
-    *(word_t *)(block->payload + wsize) = (word_t) & (block_prev->header);
+    block_t *block_curr = (block_t *)*(word_t *)(explicit_list_root->payload);
+    while (block_curr != explicit_list_root) {
+      if ((word_t) & (block->header) < (word_t) & (block_curr->header)) {
+        block_t *block_prev =
+            (block_t *)*(word_t *)(block_curr->payload + wsize);
+        *(word_t *)(block_prev->payload) = (word_t) & (block->header);
+        *(word_t *)(block->payload) = (word_t) & (block_curr->header);
+        *(word_t *)(block_curr->payload + wsize) = (word_t) & (block->header);
+        *(word_t *)(block->payload + wsize) = (word_t) & (block_prev->header);
+        return;
+      }
+      block_curr = (block_t *)*(word_t *)(block_curr->payload);
+    }
+    /* Insert after block_curr */
+    block_t *block_prev = (block_t *)*(word_t *)(block_curr->payload + wsize);
     *(word_t *)(block_prev->payload) = (word_t) & (block->header);
-    *(word_t *)(block_next->payload + wsize) = (word_t) & (block->header);
+    *(word_t *)(block->payload) = (word_t) & (block_curr->header);
+    *(word_t *)(block_curr->payload + wsize) = (word_t) & (block->header);
+    *(word_t *)(block->payload + wsize) = (word_t) & (block_prev->header);
   }
+}
+
+void print_heap() {
+  block_t *block = heap_start;
+  word_t size;
+  word_t alloc;
+  word_t alloc_next;
+  word_t num_free_block = 0;
+
+  /* High epilogue address as 7 bytes backward from last byte */
+  void *high = mem_heap_hi() - 7;
+
+  do {
+    size = get_size(block);
+    alloc = get_alloc(block);
+    alloc_next = get_alloc(find_next(block));
+    if (alloc) {
+      printf("alloc: %#011lx: %-7lu\n", (word_t) & (block->header), size);
+    }
+    if (!alloc) {
+      num_free_block++;
+      printf("free : %#011lx: %-7lu next: %#011lx prev: %#011lx\n",
+             (word_t) & (block->header), size, *(word_t *)(block->payload),
+             *(word_t *)(block->payload + wsize));
+    }
+
+    block = find_next(block);
+  } while (block != (block_t *)high);
+  printf("Free blocks: %lu\n", num_free_block);
 }
 
 /*
