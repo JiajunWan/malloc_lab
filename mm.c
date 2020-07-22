@@ -82,16 +82,26 @@ static const size_t dsize = 2 * wsize;
 // Minimum block size (bytes)
 static const size_t min_block_size = 2 * dsize;
 
-// Expand heap by chunksize (4096)
-// each time no free space
+// Expand heap by at least chunksize (4096) each time no free space
 // (Must be divisible by dsize)
 static const size_t chunksize = (1L << 12);
+
+/* Heap init size */
+static const size_t initsize = (1L << 6);
 
 // Mask to get the alloc bit
 static const word_t alloc_mask = 0x1;
 
 // Mask to get the size
 static const word_t size_mask = ~(word_t)0xF;
+
+/* Seg list buckets count */
+static const size_t seg_count = 14;
+
+/* Seg list size const array */
+static const size_t seg_size[seg_count] = {32,    64,    96,    128,      256,
+                                           512,   1024,  2048,  4096,     8192,
+                                           16384, 32768, 65536, INT64_MAX};
 
 /* Represents the header and payload of one block in the heap */
 typedef struct block {
@@ -100,6 +110,7 @@ typedef struct block {
   char payload[0];
 } block_t;
 
+/* Free alias struct for payload area usage */
 struct free {
   block_t *next;
   block_t *prev;
@@ -109,9 +120,7 @@ struct free {
 /* Global variables */
 
 /* Explicit free list root pointer, lowest address, insert starting point */
-block_t *explicit_list_root = NULL;
-
-// word_t malloc_count = 0;
+block_t *seg_list_root[seg_count];
 
 // Pointer to first block
 static block_t *heap_start = NULL;
@@ -120,10 +129,12 @@ static block_t *heap_start = NULL;
 
 /* Own helpers */
 /* Remove free list block */
-void remove_block(block_t *block);
-/* Address order insertion */
-void insert_block_order(block_t *block);
-void insert_block_before(block_t *block, block_t *block_next);
+void remove_block(block_t *block, block_t **root);
+/* Insert before one block */
+void insert_block_before(block_t *block, block_t **block_next, bool is_root);
+/* Block size to correct seg bucket list */
+block_t **size_to_root(size_t size);
+/* Print the whole heap helper */
 void print_heap();
 
 bool mm_checkheap(int lineno);
@@ -174,10 +185,13 @@ bool mm_init(void) {
 
   // Heap starts with first "block header", currently the epilogue
   heap_start = (block_t *)&(start[1]);
-  explicit_list_root = NULL;
+  /* Init seg list */
+  for (size_t i = 0; i < seg_count; i++) {
+    seg_list_root[i] = NULL;
+  }
 
   // Extend the empty heap with a free block of chunksize bytes
-  if (extend_heap(chunksize) == NULL) {
+  if (extend_heap(initsize) == NULL) {
     return false;
   }
 
@@ -372,9 +386,6 @@ static block_t *extend_heap(size_t size) {
   // Coalesce in case the previous block was free
   block = coalesce_block(block);
 
-  // /* Insert new block at root */
-  // insert_block_oder(block);
-
   return block;
 }
 
@@ -399,8 +410,8 @@ static block_t *coalesce_block(block_t *block) {
   bool next_alloc = get_alloc(block_next);
 
   if (prev_alloc && next_alloc) { // Case 1
-    /* Insert at order */
-    insert_block_order(block);
+    /* FIFO insert */
+    insert_block_before(block, size_to_root(size), true);
   }
 
   else if (prev_alloc && !next_alloc) { // Case 2
@@ -409,59 +420,38 @@ static block_t *coalesce_block(block_t *block) {
     write_header(block, size, false);
     write_footer(block, size, false);
 
-    // /* Remove next block from list and insert at root */
-    // remove_block(block_next);
-    // insert_block_order(block);
-    block_t *block_next_next = ((struct free *)block_next->payload)->next;
-    remove_block(block_next);
-
-    /* No free block */
-    if (explicit_list_root == NULL) {
-      insert_block_order(block);
-    }
-    /* One free block */
-    else if (block_next_next == explicit_list_root) {
-      insert_block_order(block);
-    }
-    /* Before next free block */
-    else if (block < block_next_next) {
-      insert_block_before(block, block_next_next);
-    }
-    /* Tail of free list */
-    else {
-      /* Insert before root */
-      insert_block_before(block, explicit_list_root);
-      /* Update root to previous root */
-      explicit_list_root = ((struct free *)explicit_list_root->payload)->next;
-    }
+    /* Remove next block from list and insert at root */
+    remove_block(block_next, size_to_root(get_size(block_next)));
+    insert_block_before(block, size_to_root(size), true);
   }
 
   else if (!prev_alloc && next_alloc) { // Case 3
-    /* Address order do not need to remove */
-    // remove_block(block_prev);
+    /* FIFO remove */
+    remove_block(block_prev, size_to_root(get_size(block_prev)));
 
     size += get_size(block_prev);
     write_header(block_prev, size, false);
     write_footer(block_prev, size, false);
     block = block_prev;
 
-    /* Address order do not need to insert */
-    // insert_block_order(block);
+    /* FIFO seg size insertion */
+    insert_block_before(block, size_to_root(size), true);
+
   }
 
   else { // Case 4
-    /* Address order do not need to remove */
-    // remove_block(block_prev);
+    /* FIFO remove */
+    remove_block(block_next, size_to_root(get_size(block_next)));
+    remove_block(block_prev, size_to_root(get_size(block_prev)));
 
     size += get_size(block_next) + get_size(block_prev);
     write_header(block_prev, size, false);
     write_footer(block_prev, size, false);
     block = block_prev;
 
-    /* Remove next block and block from list and insert at root */
-    remove_block(block_next);
-    /* Address order do not need to insert */
-    // insert_block_order(block);
+    /* FIFO seg size insertion */
+    insert_block_before(block, size_to_root(size), true);
+
   }
 
   dbg_ensures(!get_alloc(block));
@@ -481,10 +471,8 @@ static void split_block(block_t *block, size_t asize) {
 
   size_t block_size = get_size(block);
 
-  block_t *block_next = ((struct free *)block->payload)->next;
-  // block_t *block_prev = (block_t *)(block->payload)->prev;
   /* Remove splitted block */
-  remove_block(block);
+  remove_block(block, size_to_root(block_size));
 
   /* Split if there is enough free space */
   if ((block_size - asize) >= min_block_size) {
@@ -496,25 +484,9 @@ static void split_block(block_t *block, size_t asize) {
     write_header(block_new, block_size - asize, false);
     write_footer(block_new, block_size - asize, false);
 
-    /* No free block */
-    if (explicit_list_root == NULL) {
-      insert_block_order(block_new);
-    }
-    /* One free block */
-    else if (block_next == explicit_list_root) {
-      insert_block_order(block_new);
-    }
-    /* Before next free block */
-    else if (block_new < block_next) {
-      insert_block_before(block_new, block_next);
-    }
-    /* Tail of free list */
-    else {
-      /* Insert before root */
-      insert_block_before(block_new, explicit_list_root);
-      /* Update root to previous root */
-      explicit_list_root = ((struct free *)explicit_list_root->payload)->next;
-    }
+    /* FIFO seg size insertion */
+    insert_block_before(block_new, size_to_root(block_size - asize), true);
+
   }
 
   dbg_ensures(get_alloc(block));
@@ -527,36 +499,46 @@ static void split_block(block_t *block, size_t asize) {
  * <Are there any preconditions or postconditions?>
  */
 static block_t *find_fit(size_t asize) {
-  if (explicit_list_root == NULL) {
-    return NULL;
-  }
-  block_t *block = explicit_list_root;
+  block_t *block = NULL;
   block_t *block_best = NULL;
   size_t size = 0;
   size_t size_best = 0;
-  int timeout = 2;
+  int timeout = 4;
   int i = 0;
+  size_t n;
   bool found_fit = false;
 
-  /* Traverse the free list */
-  do {
-    size = get_size(block);
-    /* Find best fit */
-    if (asize <= size) {
-      if (!found_fit) {
-        block_best = block;
-        size_best = size;
-        found_fit = true;
-      }
-      if (size <= size_best) {
-        block_best = block;
-        size_best = size;
-      }
-      i++;
+  /* Find the correct size bucket */
+  /* Increase n until found correct size or the end */
+  for (n = 0; n < seg_count; n++) {
+    if (asize <= seg_size[n]) {
+      break;
     }
-    block = ((struct free *)block->payload)->next;
-  } while (i < timeout && block != explicit_list_root);
-
+  }
+  /* Traverse the free list */
+  while (n < seg_count && !found_fit) {
+    block = seg_list_root[n];
+    if (block != NULL) {
+      do {
+        size = get_size(block);
+        /* Find best fit */
+        if (asize <= size) {
+          if (!found_fit) {
+            block_best = block;
+            size_best = size;
+            found_fit = true;
+          }
+          if (size <= size_best) {
+            block_best = block;
+            size_best = size;
+          }
+          i++;
+        }
+        block = ((struct free *)block->payload)->next;
+      } while (i < timeout && block != seg_list_root[n]);
+    }
+    n++;
+  }
   return block_best;
 }
 
@@ -571,6 +553,7 @@ static block_t *find_fit(size_t asize) {
  * - coalescing
  * - next/prev pointers consistency
  * - next/prev pointers heap boundary
+ * - block bucket size range
  * - free block numbers consistency
  * - epilogue
  */
@@ -658,45 +641,52 @@ bool mm_checkheap(int line) {
     /* Check free list */
     block_t *block_curr;
     block_t *block_next;
+    size_t i = 0;
 
-    block_curr = explicit_list_root;
-    if (explicit_list_root != NULL) {
-      /* Check from root */
-      do {
-        block_next = ((struct free *)block_curr->payload)->next;
-        /* Check next/prev pointers consistency */
-        if (block_curr != ((struct free *)block_next->payload)->prev) {
-          printf("Curr address: %#011lx\n", (word_t) & (block_curr->header));
-          printf("Next address: %#011lx\n", (word_t) & (block_next->header));
-          printf("Prev address: %#011lx\n",
-                 (word_t) &
-                     ((((struct free *)block_next->payload)->prev)->header));
-          perror("Next/prev pointers inconsistent error!\n");
-          return false;
-        }
+    /* Check each bucket */
+    while (i < seg_count) {
+      block_curr = seg_list_root[i];
+      if (block_curr != NULL) {
+        /* Check from root */
+        do {
+          block_next = ((struct free *)block_curr->payload)->next;
 
-        /* Address order insertion check */
-        if (block_curr > block_next && block_next != explicit_list_root) {
-          printf("Curr address: %#011lx\n", (word_t) & (block_curr->header));
-          printf("Next address: %#011lx\n", (word_t) & (block_next->header));
-          perror("Free list address order error!\n");
-          return false;
-        }
+          /* Check next/prev pointers consistency */
+          if (block_curr != ((struct free *)block_next->payload)->prev) {
+            printf("Curr address: %#011lx\n", (word_t) & (block_curr->header));
+            printf("Next address: %#011lx\n", (word_t) & (block_next->header));
+            printf("Prev address: %#011lx\n",
+                   (word_t) &
+                       ((((struct free *)block_next->payload)->prev)->header));
+            perror("Next/prev pointers inconsistent error!\n");
+            return false;
+          }
 
-        /* Check heap boundaries */
-        /* Low address as 8 bytes forward from prologue */
-        if (((void *)((struct free *)block_curr->payload)->next < low + 8) ||
-            ((void *)((struct free *)block_curr->payload)->next > high) ||
-            ((void *)((struct free *)block_curr->payload)->prev < low + 8) ||
-            ((void *)((struct free *)block_curr->payload)->prev > high)) {
-          perror("Next/prev pointers heap boundary error!\n");
-          return false;
-        }
-        /* Count free list */
-        num_free_list++;
+          /* Check heap boundaries */
+          /* Low address as 8 bytes forward from prologue */
+          if (((void *)((struct free *)block_curr->payload)->next < low + 8) ||
+              ((void *)((struct free *)block_curr->payload)->next > high) ||
+              ((void *)((struct free *)block_curr->payload)->prev < low + 8) ||
+              ((void *)((struct free *)block_curr->payload)->prev > high)) {
+            perror("Next/prev pointers heap boundary error!\n");
+            return false;
+          }
 
-        block_curr = ((struct free *)block_curr->payload)->next;
-      } while (block_curr != explicit_list_root);
+          /* Check block bucket size range */
+          if (get_size(block_curr) > seg_size[i]) {
+            printf("block_curr size: %lu\n", get_size(block_curr));
+            printf("seg_size   size: %lu\n", seg_size[i]);
+            perror("Block bucket size range error!\n");
+            return false;
+          }
+
+          /* Count free list */
+          num_free_list++;
+
+          block_curr = ((struct free *)block_curr->payload)->next;
+        } while (block_curr != seg_list_root[i]);
+      }
+      i++;
     }
 
     /* Check free block/free list numbers consistency */
@@ -714,19 +704,18 @@ bool mm_checkheap(int line) {
   return true;
 }
 
-void remove_block(block_t *block) {
+void remove_block(block_t *block, block_t **root) {
   /* Case 1: Only one block */
-  if (explicit_list_root ==
-      ((struct free *)explicit_list_root->payload)->next) {
-    explicit_list_root = NULL;
+  if (*root == ((struct free *)(*root)->payload)->next) {
+    *root = NULL;
   }
 
   /* Case 2: Block is root */
-  else if (block == explicit_list_root) {
-    block_t *tail = ((struct free *)explicit_list_root->payload)->prev;
-    explicit_list_root = ((struct free *)block->payload)->next;
-    ((struct free *)explicit_list_root->payload)->prev = tail;
-    ((struct free *)tail->payload)->next = explicit_list_root;
+  else if (block == *root) {
+    block_t *tail = ((struct free *)(*root)->payload)->prev;
+    *root = ((struct free *)block->payload)->next;
+    ((struct free *)(*root)->payload)->prev = tail;
+    ((struct free *)tail->payload)->next = *root;
   }
 
   /* Case 3: Block is else where */
@@ -738,66 +727,34 @@ void remove_block(block_t *block) {
   }
 }
 
-void insert_block_order(block_t *block) {
+void insert_block_before(block_t *block, block_t **block_next, bool is_root) {
   /* Case 1: No next block, empty list */
-  if (explicit_list_root == NULL) {
-    explicit_list_root = block;
-    ((struct free *)explicit_list_root->payload)->next = explicit_list_root;
-    ((struct free *)explicit_list_root->payload)->prev = explicit_list_root;
-  }
-
-  /* Case 2: Address before root */
-  else if (block < explicit_list_root) {
-    block_t *tail = ((struct free *)explicit_list_root->payload)->prev;
-    ((struct free *)tail->payload)->next = block;
-    ((struct free *)block->payload)->next = explicit_list_root;
-    ((struct free *)explicit_list_root->payload)->prev = block;
-    ((struct free *)block->payload)->prev = tail;
-    explicit_list_root = block;
-  }
-
-  /* Case 3: Address after root */
-  else {
-    block_t *block_curr = ((struct free *)explicit_list_root->payload)->next;
-    while (block_curr != explicit_list_root) {
-      if (block < block_curr) {
-        block_t *block_prev = ((struct free *)block_curr->payload)->prev;
-        ((struct free *)block_prev->payload)->next = block;
-        ((struct free *)block->payload)->next = block_curr;
-        ((struct free *)block_curr->payload)->prev = block;
-        ((struct free *)block->payload)->prev = block_prev;
-        return;
-      }
-      block_curr = ((struct free *)block_curr->payload)->next;
-    }
-    /* Insert after block_curr */
-    block_t *block_prev = ((struct free *)block_curr->payload)->prev;
-    ((struct free *)block_prev->payload)->next = block;
-    ((struct free *)block->payload)->next = block_curr;
-    ((struct free *)block_curr->payload)->prev = block;
-    ((struct free *)block->payload)->prev = block_prev;
-  }
-}
-
-void insert_block_before(block_t *block, block_t *block_next) {
-  /* Case 1: No next block, empty list */
-  if (block_next == NULL) {
-    explicit_list_root = block;
-    ((struct free *)explicit_list_root->payload)->next = explicit_list_root;
-    ((struct free *)explicit_list_root->payload)->prev = explicit_list_root;
+  if (*block_next == NULL) {
+    *block_next = block;
+    ((struct free *)block->payload)->next = block;
+    ((struct free *)block->payload)->prev = block;
   }
   /* Case 2: Not empty free list */
   else {
-    block_t *block_prev = ((struct free *)block_next->payload)->prev;
+    block_t *block_prev = ((struct free *)(*block_next)->payload)->prev;
     ((struct free *)block_prev->payload)->next = block;
-    ((struct free *)block->payload)->next = block_next;
-    ((struct free *)block_next->payload)->prev = block;
+    ((struct free *)block->payload)->next = (*block_next);
+    ((struct free *)(*block_next)->payload)->prev = block;
     ((struct free *)block->payload)->prev = block_prev;
     /* Update root if next block is root */
-    if (block_next == explicit_list_root) {
-      explicit_list_root = block;
+    if (is_root) {
+      (*block_next) = block;
     }
   }
+}
+
+block_t **size_to_root(size_t asize) {
+  for (size_t i = 0; i < seg_count; i++) {
+    if (asize <= seg_size[i]) {
+      return &seg_list_root[i];
+    }
+  }
+  return &seg_list_root[seg_count];
 }
 
 void print_heap() {
@@ -821,8 +778,8 @@ void print_heap() {
       num_free_block++;
       printf("free : %#011lx: %-7lu next: %#011lx prev: %#011lx\n",
              (word_t) & (block->header), size,
-             *(word_t *)((struct free *)block->payload)->next,
-             *(word_t *)((struct free *)block->payload)->prev);
+             (word_t)(((struct free *)block->payload)->next),
+             (word_t)(((struct free *)block->payload)->prev));
     }
 
     block = find_next(block);
